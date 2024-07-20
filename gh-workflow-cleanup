@@ -1,0 +1,134 @@
+#!/usr/bin/env -S bash -xe -o pipefail
+
+# Function to list workflows
+list_workflows() {
+  local repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)
+  if [ -z "$repo" ]; then
+    echo "No default repository found. Please enter the repository (owner/repo):" >&2
+    read -r repo
+  fi
+  gh api "repos/$repo/actions/workflows" --jq '.workflows[] | "\(.id) \(.name)"'
+}
+
+# Function to list workflow runs by workflow ID
+list_runs() {
+  local workflow_id=$1
+  local since_date=$2
+  local repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)
+  if [ -z "$repo" ]; then
+    echo "No default repository found. Please enter the repository (owner/repo):" >&2
+    read -r repo
+  fi
+  
+  local query=""
+  if [ -n "$since_date" ]; then
+    query="?created=>${since_date}"
+  fi
+
+  gh api "repos/$repo/actions/workflows/$workflow_id/runs$query" --paginate --jq '.workflow_runs[] | "\(.id) \(.status) \(.conclusion) \(.created_at)"'
+}
+
+# Function to prompt for a delay and calculate the date
+get_date_from_delay() {
+  read -p "Enter a delay (e.g., '5 minutes ago', '2 hours ago', '1 day ago') to clean up runs since (leave empty for all): " delay
+  if [ -n "$delay" ]; then
+    # Use date to calculate the time and format it as YYYY-MM-DDTHH:MM:SSZ
+    since_date=$(date --date="$delay" --utc +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+    if [ $? -ne 0 ]; then
+      cat <<! | cut -c 5- >&2
+       Invalid delay format. Please use one of the following formats:
+       - 'X minutes ago' (e.g., '5 minutes ago', '30 minutes ago')
+       - 'X hours ago' (e.g., '2 hours ago', '24 hours ago')
+       - 'X days ago' (e.g., '1 day ago', '7 days ago')
+       - Specific date and time (e.g., '2023-07-20 14:30:00')
+!
+      return 1
+    fi
+  fi
+  echo "$since_date"
+}
+
+# Function to list workflow runs by workflow ID
+list_runs() {
+  local workflow_id=$1
+  local since_date=$2
+  local repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)
+  if [ -z "$repo" ]; then
+    echo "No default repository found. Please enter the repository (owner/repo):" >&2
+    read -r repo
+  fi
+  
+  local query=""
+  if [ -n "$since_date" ]; then
+    query="?created=>$since_date"
+  fi
+
+  gh api "repos/$repo/actions/workflows/$workflow_id/runs$query" --paginate --jq '.workflow_runs[] | "\(.id) \(.status) \(.conclusion) \(.created_at)"'
+}
+
+# Function to delete a workflow run
+delete_run() {
+  local run_id=$1
+  echo "Deleting workflow run: $run_id" >&2
+  local repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)
+  if [ -z "$repo" ]; then
+    echo "No default repository found. Please enter the repository (owner/repo):" >&2
+    read -r repo
+  fi
+  gh api -X DELETE "repos/$repo/actions/runs/$run_id"
+}
+
+# Function to prompt the user to select a workflow
+select_workflow() {
+  echo "Available workflows:" >&2
+  workflows=$(list_workflows)
+  if [ -z "$workflows" ]; then
+    echo "No workflows found or unable to access repository." >&2
+    return 1
+  fi
+  echo "$workflows" | nl -w 2 -s '. ' >&2
+  echo >&2
+  read -p "Enter the number of the workflow you want to clean up: " workflow_number
+  selected_workflow=$(echo "$workflows" | sed -n "${workflow_number}p")
+  selected_workflow_id=$(echo "$selected_workflow" | awk '{print $1}')
+  echo "You selected: $selected_workflow_id" >&2
+  echo "$selected_workflow_id"
+}
+
+case "$1" in
+  list-workflows)
+    list_workflows
+    ;;
+  list-runs)
+    if [ -z "$2" ]; then
+      echo "Usage: $0 list-runs <workflow_id> [delay]" >&2
+      exit 1
+    fi
+    since_date=$(get_date_from_delay)
+    list_runs "$2" "$since_date"
+    ;;
+  delete-run)
+    if [ -z "$2" ]; then
+      echo "Usage: $0 delete-run <run_id>" >&2
+      exit 1
+    fi
+    delete_run "$2"
+    ;;
+  cleanup)
+    workflow_id=$(select_workflow)
+    since_date=$(get_date_from_delay)
+    list_runs "$workflow_id" "$since_date"
+    read -p "Enter the ID of the run you want to delete (or 'all' to delete all runs): " run_id
+    if [ "$run_id" = "all" ]; then
+      list_runs "$workflow_id" "$since_date" | awk '{print $1}' | while read -r id; do
+        delete_run "$id"
+      done
+    else
+      delete_run "$run_id"
+    fi
+    ;;
+  *)
+    echo "Usage: $0 {list-workflows|list-runs|delete-run|cleanup} [workflow_id] [delay]" >&2
+    exit 1
+    ;;
+esac
