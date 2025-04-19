@@ -1,22 +1,22 @@
-#!/usr/bin/env -S bash -ex -o pipefail
-exec 2>/tmp/log
+#!/usr/bin/env -S bash -eu -o pipefail
 
+"${GH_DEBUG:-false}" &&
+  set -x
 
-PKG_TYPE="maven"
-SCRIPT="$(realpath "$0")"
+THISSH="$(realpath "$0")"
 
 function help()
 {
     cat <<EOF
 Manage packages of type container posted to ghcr.io
 Usage:
-  gh maven <command>
+  gh packages <command>
 Commands:
-  packages       List packages of type maven
-  versions       List versions of a maven package
-  clean          Clean versions a maven package
-  delete         Delete a maven package
-  browse         Browse versions of a maven package with fzf
+  list           List packages of type maven
+  versions       List versions of a package
+  clean          Clean versions a package
+  delete         Delete a package
+  browse         Browse versions of a package with fzf
 
 Flags:
   -h, --help Show this help and exit
@@ -28,11 +28,11 @@ function help_version()
     cat <<EOF
 List versions of a maven package
 Usage:
-  gh maven version <package name>
+  gh package version <type> <name>
 
 Flags:
-  --show-pkg-name    Show column with package name
-  -h, --help         Show this help and exit
+  --show-pkgname    Show column with package name
+  -h, --help        Show this help and exit
 EOF
 }
 
@@ -46,7 +46,7 @@ function help_browse()
     cat <<EOF
 Browse with fzf through verion of a package
 Usage:
-  gh maven browse <package name>
+  gh maven browse <type> <name>
 
 Actions:
   From within fzf, multiple bindings are available:
@@ -59,17 +59,17 @@ function help_clean()
     cat <<EOF
 Clean a package version
 Usage:
-  gh maven clean <package name> [<package version id>] [flags]
+  gh maven clean <type> <name> [<package version id>] [flags]
 
 Flags:
   -h, --help         Show this help and exit
 
 Examples:
-  # Remove version 1234 of my-package
-  gh maven clean my-package 1234
+  # Remove version 1234 of my container package
+  gh maven clean container container package 1234
 
-  # Remove all versions of my-package
-  gh maven clean my-package
+  # Remove all versions of container package
+  gh maven clean container package
 EOF
 }
 
@@ -78,14 +78,14 @@ function help_delete()
     cat <<EOF
 Delete a package
 Usage:
-  gh maven delete <package name>
+  gh maven delete <type> <name>
 
 Flags:
   -h, --help         Show this help and exit
 
 Examples:
-  # Delete my-package
-  gh maven delete my-package
+  # Delete my container package
+  gh maven delete container my-package
 EOF
 }
 
@@ -109,50 +109,37 @@ function gh:api:delete()
 }
 
 function gh:api:list() {
-  local url=$1
+  local url="$1"; shift
 
-  local page
-  local response
-
-  for ((page=1; ; page++)); do
-    response=$( gh:api "$url&page=$page" )
-    if [ "$( echo "$response" | yq '. | length' )" -eq 0 ]; then
-      break
-    fi
-    cat <<<"$response"
-  done
+  gh:api --paginate --slurp $url |
+    yq eval '.[]'
 }
 
 function gh:api:packages:delete()
 {
-    local username
-    local group
-    local artifact
+    local username type
 
     username="$1"
-    group="${2:-*}"
-    artifact="${3:-*}"
+    type="$2"
 
     exec 3>&1
-    for name in $( gh:api:packages:list "$group" "$artifact" | tee >(cat >&3) | yq eval  '.[] | .name' ); do
-      gh:api:delete "/user/packages/maven/${name}"
+    for name in $( gh:api:packages:list $type | tee >(cat >&3) | yq eval  '.[] | .name' ); do
+      gh:api:delete "/user/packages/${type}/$( urlencode ${name} )"
     done
     exec 3>&-
 }
 
 function gh:api:packages:list()
 {
-  local group=${1:-*}
-  local artifact=${2:-*}
+  local type="$1"; shift
 
-  gh:api:list \
-    "/user/packages?package_type=$PKG_TYPE" |
-    yq eval "map(select(.name == \"${group}.${artifact}\"))"
+  gh:api:list "/user/packages?package_type=$type"
 }
 
 function gh:api:packages:versions:list()
 {
-    local pkg_name
+    local type
+    local name
     local query
     local titles
     local params
@@ -166,8 +153,8 @@ function gh:api:packages:versions:list()
                 help_version
                 exit 0
                 ;;
-            --show-pkg-name)
-                show_pkg_name=1
+            --show-name)
+                show_name=1
                 ;;
             *)
                 params+="$1"
@@ -176,32 +163,34 @@ function gh:api:packages:versions:list()
         shift
     done
     eval set -- "${params}"
-    pkg_name="$1"
+    type="$1"; shift
+    name="$1"; shift
 
-    if [ ${show_pkg_name} -eq 0 ]; then
+    if [ ${show_pkgname} -eq 0 ]; then
         titles='["ID", "NAME", "LAST UPDATE", "REPOSITORY"]'
         fields='.id, .name, .updated_at, .url'
     else
         titles='["PKG NAME", "ID", "NAME", "LAST UPDATE", "REPOSITORY"]'
-        fields="\"${pkg_name}\", "
+        fields="\"${name}\", "
         fields='.id, .name, .updated_at, .url'
     fi
     query="(${titles}), (.[] | [${fields}]) | @tsv"
 
     gh:api:list \
-      "/user/packages/${PKG_TYPE}/${pkg_name}/versions" | \
+      "/user/packages/${type}/$( urlencode ${name} )/versions" | \
       yq "${query}" | \
       column -ts $'\t'
 }
 
 function gh:api:packages:versions:delete()
 {
-    local username="$1"
-    local name="$2"
-    local version="$3"
+    local username="$1"; shift
+    local type="$1"; shift
+    local name="$1; shift"
+    local version="$1"; shift
 
     gh:api:delete \
-      "/users/${username}/packages/${PKG_TYPE}/${name}/versions/${version}"
+      "/users/${username}/packages/${type}/$( urlencode ${name} )/versions/${version}"
 }
 
 function browse()
@@ -209,7 +198,8 @@ function browse()
     local params
     local titles
     local fields
-    local pkg_name
+    local type
+    local name
 
     while [ $# -gt 0 ]; do
         case $1 in
@@ -223,13 +213,13 @@ function browse()
         esac
         shift
     done
-    pkg_name="$1"
-
+    name="$1"; shift
+    type="$1"; shift
     titles='["NAME", "ID"]'
     fields='[.name, .id]'
     query="(${titles}), (.[] | ${fields}) | @tsv"
     export -f gh:api:packages:versions:list
-    export PKG_TYPE
+    export PKG_TYPE=$type
     export HDR_ACCEPT
     export HDR_API_VERSION
     export FZF_DEFAULT_COMMAND="gh:api:packages:versions:list"
@@ -237,14 +227,14 @@ function browse()
     fzf \
         --bind "ctrl-h:toggle-preview" --preview "echo '${FZF_BROWSE_HELP}'" --preview-window hidden \
         --bind "ctrl-r:reload#${FZF_DEFAULT_COMMAND}#" \
-        --bind "ctrl-x:execute#echo {} | awk '{print $2}' | xargs ${SCRIPT} clean #" \
+        --bind "ctrl-x:execute#echo {} | awk '{print $2}' | xargs ${THISSH} clean #" \
         --bind "ctrl-x:+reload#${FZF_DEFAULT_COMMAND}#" \
         --preview-window=down,$(echo "${FZF_BROWSE_HELP}" | wc -l) \
         --color preview-bg:#222222 \
         --header-lines=1
 }
 
-function packages() {
+function list() {
   gh:api:packages:list $@
 }
 
@@ -270,7 +260,7 @@ function delete()
     local username="$( gh:api:login )"
 
     gh:api:packages:delete "${username}" "${@}"
-  }
+}
 
 function clean()
 {
@@ -288,15 +278,21 @@ function clean()
     done
 
     local username="$(gh:api:login)"
-    local name="$1"
+    local type="$1"; shift
+    if [ -z "${type}" ]; then
+        echo "Error: Missing package type"
+        help_clean
+        exit 1
+    fi
+    local name="$1"; shift
     if [ -z "${name}" ]; then
         echo "Error: Missing package name"
         help_clean
         exit 1
     fi
-    local versions="${@:2}"
+    local versions="${@}"
     for id in $( gh:api:packages:versions:list | yq '. | .name' ); do
-      gh:api:packages:versions:delete "${name}" "${id}"
+      gh:api:packages:versions:delete "${type}" "${name}" "${id}"
     done
 }
 
@@ -308,7 +304,7 @@ while [ $# -gt 0 ]; do
             help
             exit 0
             ;;
-        browse|packages|versions|delete|clean)
+        browse|list|versions|delete|clean)
             ACTION="$1"
             ;;
         *)
@@ -322,7 +318,7 @@ while [ $# -gt 0 ]; do
 done
 
 case "${ACTION}" in
-   browse|packages|versions|delete|clean)
+   browse|list|versions|delete|clean)
     ${ACTION} $@
     ;;
   *)
